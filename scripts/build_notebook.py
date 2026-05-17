@@ -347,6 +347,112 @@ for ax, feat in zip(axes.flat, features_to_plot):
 plt.tight_layout()
 plt.show()"""))
 
+cells.append(make_code("""# Compute LF thresholds from data statistics (no magic numbers)
+pos_samples = df[df["best_iou"] > 0.5].copy()
+
+if len(pos_samples) > 0:
+    # Per-class statistics
+    print("Per-class statistics for threshold computation:")
+    class_stats = {}
+    for cls_id, cls_name in CLASS_NAMES.items():
+        cls_df = pos_samples[pos_samples["best_class"] == cls_id]
+        if len(cls_df) > 0:
+            means = cls_df[["mean_r", "mean_g", "mean_b"]].mean()
+            total = means.sum() + 1e-10
+            class_stats[cls_name] = {
+                "n": len(cls_df),
+                "red_ratio": (means["mean_r"] / total),
+                "blue_ratio": (means["mean_b"] / total),
+                "area_median": cls_df["area"].median(),
+                "area_p25": cls_df["area"].quantile(0.25),
+                "area_p75": cls_df["area"].quantile(0.75),
+                "std_median": cls_df[["std_r", "std_g", "std_b"]].mean(axis=1).median(),
+                "aspect_median": cls_df["aspect_ratio"].median(),
+            }
+            print(f"  {cls_name} (n={class_stats[cls_name]['n']}):")
+            print(f"    R ratio={class_stats[cls_name]['red_ratio']:.3f}, B ratio={class_stats[cls_name]['blue_ratio']:.3f}")
+            print(f"    Area: median={class_stats[cls_name]['area_median']:.0f}, p25={class_stats[cls_name]['area_p25']:.0f}, p75={class_stats[cls_name]['area_p75']:.0f}")
+            print(f"    Std: median={class_stats[cls_name]['std_median']:.1f}, Aspect: median={class_stats[cls_name]['aspect_median']:.2f}")
+
+    # --- Define data-driven thresholds ---
+    # Use class_stats with fallbacks for missing classes
+    wbc_stats = class_stats.get("WBC")
+    rbc_stats = class_stats.get("RBC")
+    plt_stats = class_stats.get("Platelets")
+
+    # Size thresholds
+    if rbc_stats and wbc_stats:
+        WBC_AREA_LOWER = int((rbc_stats["area_median"] + wbc_stats["area_median"]) / 2)
+    else:
+        WBC_AREA_LOWER = 2000
+    if plt_stats and rbc_stats:
+        PLATELET_AREA_UPPER = int((plt_stats["area_median"] + rbc_stats["area_median"]) / 2)
+    elif rbc_stats:
+        PLATELET_AREA_UPPER = int(rbc_stats["area_p25"])
+    else:
+        PLATELET_AREA_UPPER = 800
+    PLATELET_AREA_LOWER = int(max(50, plt_stats["area_p25"] * 0.5)) if plt_stats else 50
+    print(f"\\nComputed thresholds: WBC >= {WBC_AREA_LOWER}, RBC >= {PLATELET_AREA_UPPER}, Platelet >= {PLATELET_AREA_LOWER}")
+
+    # Red ratio threshold: midpoint between WBC and RBC medians
+    if rbc_stats and wbc_stats:
+        RBC_RED_RATIO = (rbc_stats["red_ratio"] + wbc_stats["red_ratio"]) / 2
+    else:
+        RBC_RED_RATIO = 0.36
+    print(f"  Red ratio > {RBC_RED_RATIO:.3f} -> RBC")
+
+    # Blue ratio threshold: midpoint between WBC and RBC medians  
+    if wbc_stats and rbc_stats:
+        WBC_BLUE_RATIO = (wbc_stats["blue_ratio"] + rbc_stats["blue_ratio"]) / 2
+    else:
+        WBC_BLUE_RATIO = 0.34
+    WBC_AREA_LOWER_STD = int(wbc_stats["area_p25"]) if wbc_stats else 1500
+    print(f"  Blue ratio > {WBC_BLUE_RATIO:.3f} + area > {WBC_AREA_LOWER_STD} -> WBC")
+
+    # Color std thresholds: boundary between WBC (high) and RBC (low)
+    WBC_STD_t = wbc_stats["std_median"] * 0.8 if wbc_stats else 25
+    RBC_STD_t = rbc_stats["std_median"] * 1.2 if rbc_stats else 15
+    print(f"  Std > {WBC_STD_t:.1f} -> WBC, Std < {RBC_STD_t:.1f} -> RBC (computed from class medians)")
+
+    # Aspect ratio thresholds
+    if rbc_stats and wbc_stats:
+        RBC_AR_UPPER = (rbc_stats["aspect_median"] + wbc_stats["aspect_median"]) / 2
+        WBC_AR_LOWER = RBC_AR_UPPER * 1.1
+        RBC_AR_LOWER = max(0.7, rbc_stats["aspect_median"] * 0.8)
+    else:
+        RBC_AR_UPPER = 1.4
+        WBC_AR_LOWER = 1.5
+        RBC_AR_LOWER = 0.7
+    print(f"  Aspect ratio: {RBC_AR_LOWER:.2f}-{RBC_AR_UPPER:.2f} -> RBC, > {WBC_AR_LOWER:.2f} -> WBC")
+
+    # Visualize RGB distributions per class
+    fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+    for i, (channel, color) in enumerate([("mean_r", "red"), ("mean_g", "green"), ("mean_b", "blue")]):
+        for cls_id, cls_name in CLASS_NAMES.items():
+            cls_df = pos_samples[pos_samples["best_class"] == cls_id]
+            if len(cls_df) > 0:
+                axes[i].hist(cls_df[channel], bins=20, alpha=0.5, label=cls_name)
+        axes[i].set_title(f"{color.title()} channel")
+        axes[i].set_xlabel("Mean intensity")
+        axes[i].legend()
+    plt.suptitle("Per-class RGB distributions (thresholds computed from these)")
+    plt.tight_layout()
+    plt.show()
+else:
+    # Fallback defaults if no GT proposals available
+    WBC_AREA_LOWER = 2000
+    PLATELET_AREA_UPPER = 800
+    PLATELET_AREA_LOWER = 50
+    RBC_RED_RATIO = 0.36
+    WBC_BLUE_RATIO = 0.34
+    WBC_AREA_LOWER_STD = 1500
+    WBC_STD_t = 25
+    RBC_STD_t = 15
+    RBC_AR_UPPER = 1.4
+    WBC_AR_LOWER = 1.5
+    RBC_AR_LOWER = 0.7
+    print("No GT proposals available. Using default thresholds.")"""))
+
 # ============================================================
 # SECTION 5: Snorkel Labeling Functions
 # ============================================================
@@ -358,12 +464,12 @@ We write 6 labeling functions that classify each proposal based on visual heuris
 
 | LF | Heuristic | Logic |
 |---|---|---|
-| `lf_size` | Area thresholds | Large (>5000)→WBC, Medium(800-5000)→RBC, Small(<800)→Platelet |
-| `lf_color_rbc` | Reddish color | High R, low B → RBC |
-| `lf_color_wbc` | Purple/blue nucleus | High B channel, large area → WBC |
-| `lf_aspect_ratio` | Shape | Round(AR~1)→RBC, Elongated(AR>1.8)→WBC |
-| `lf_edge_density` | Nucleus texture | High edge density → WBC |
-| `lf_background` | Low signal | Low variance + low edges → ABSTAIN |
+| `lf_size` | Area thresholds | Uses median-based midpoints between classes |
+| `lf_red_ratio` | Normalized red ratio | R/(R+G+B) > data-driven threshold → RBC |
+| `lf_blue_ratio` | Normalized blue ratio | B/(R+G+B) > data-driven threshold + area → WBC |
+| `lf_aspect_ratio` | Shape | Round → RBC, Elongated → WBC (computed from class medians) |
+| `lf_color_std` | Color variance | High std → WBC, Low std → RBC (computed from class medians) |
+| `lf_position` | Spatial location | Central proposals with cell-like size → WBC/RBC |
 
 **ABSTAIN** means the LF has no opinion — Snorkel's LabelModel handles this."""))
 
@@ -379,39 +485,44 @@ df_lf.columns = [c.replace(".", "_").replace(" ", "_") for c in df_lf.columns]
 
 @labeling_function()
 def lf_size(row):
-    if row.area > 3000:
+    if row.area > WBC_AREA_LOWER:
         return WBC
-    elif row.area > 800:
+    elif row.area > PLATELET_AREA_UPPER:
         return RBC
-    elif row.area > 50:
+    elif row.area > PLATELET_AREA_LOWER:
         return PLATELET
     else:
         return ABSTAIN
 
 @labeling_function()
-def lf_color_rbc(row):
-    if row.mean_r > 100 and row.mean_b < 80:
+def lf_red_ratio(row):
+    total = row.mean_r + row.mean_g + row.mean_b + 1e-10
+    if total > 0 and (row.mean_r / total) > RBC_RED_RATIO and row.area > PLATELET_AREA_UPPER:
         return RBC
     return ABSTAIN
 
 @labeling_function()
-def lf_color_wbc(row):
-    if row.mean_b > row.mean_r * 0.8 and row.area > 2000:
+def lf_blue_ratio(row):
+    total = row.mean_r + row.mean_g + row.mean_b + 1e-10
+    if total > 0 and (row.mean_b / total) > WBC_BLUE_RATIO and row.area > WBC_AREA_LOWER_STD:
         return WBC
     return ABSTAIN
 
 @labeling_function()
 def lf_aspect_ratio(row):
-    if row.aspect_ratio > 0.7 and row.aspect_ratio < 1.4:
+    if RBC_AR_LOWER < row.aspect_ratio < RBC_AR_UPPER:
         return RBC
-    elif row.aspect_ratio > 1.5:
+    elif row.aspect_ratio > WBC_AR_LOWER:
         return WBC
     return ABSTAIN
 
 @labeling_function()
-def lf_edge_density(row):
-    if row.edge_density > 30 and row.area > 1500:
+def lf_color_std(row):
+    mean_std = (row.std_r + row.std_g + row.std_b) / 3
+    if mean_std > WBC_STD_t and row.area > WBC_AREA_LOWER_STD:
         return WBC
+    elif mean_std < RBC_STD_t and row.area > PLATELET_AREA_UPPER:
+        return RBC
     return ABSTAIN
 
 @labeling_function()
@@ -425,7 +536,7 @@ def lf_position(row):
             return RBC
     return ABSTAIN
 
-lfs = [lf_size, lf_color_rbc, lf_color_wbc, lf_aspect_ratio, lf_edge_density, lf_position]
+lfs = [lf_size, lf_red_ratio, lf_blue_ratio, lf_aspect_ratio, lf_color_std, lf_position]
 
 # Apply LFs
 applier = PandasLFApplier(lfs)
@@ -456,8 +567,8 @@ def plot_lf_decisions(image_path, proposals_df, lf_idx, n_proposals=10):
     plt.tight_layout()
     plt.show()
 
-print("Showing decisions for lf_color_rbc (index 1):")
-# The lf_color_rbc is the 2nd LF (index 1)
+print("Showing decisions for lf_red_ratio (index 1):")
+# The lf_red_ratio is the 2nd LF (index 1)
 plot_lf_decisions(
     os.path.join(IMAGES_DIR, all_filenames[0]),
     df_lf[df_lf["filename"] == all_filenames[0]],
@@ -1154,8 +1265,8 @@ print("="*60)
 print(f"\\nDataset: BCCD ({len(all_annotations)} images, 3 classes)")
 print(f"Region proposals: Selective Search (up to {MAX_PROPOSALS} per image)")
 print(f"Labeling functions: {len(lfs)} heuristic LFs")
-print(f"  - lf_size, lf_color_rbc, lf_color_wbc")
-print(f"  - lf_aspect_ratio, lf_edge_density, lf_position")
+print(f"  - lf_size, lf_red_ratio, lf_blue_ratio")
+print(f"  - lf_aspect_ratio, lf_color_std, lf_position")
 print(f"LabelModel: Trained on {len(df_lf)} proposals")
 print(f"  - High-confidence pseudo-labels: {len(pos_df_nms)} (thresh={CONFIDENCE_THRESHOLD})")
 print(f"  - Quality: {(len(pos_gt)/max(len(pos_df_nms),1)):.1%} match GT objects")

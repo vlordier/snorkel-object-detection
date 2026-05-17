@@ -32,8 +32,8 @@ for imp in key_imports:
         errors.append(f"Missing import/reference: {imp}")
 
 key_fns = [
-    "lf_size", "lf_color_rbc", "lf_color_wbc",
-    "lf_aspect_ratio", "lf_edge_density", "lf_position",
+    "lf_size", "lf_red_ratio", "lf_blue_ratio",
+    "lf_aspect_ratio", "lf_color_std", "lf_position",
     "LabelModel", "generate_proposals", "extract_features",
     "nms", "build_coco_json",
 ]
