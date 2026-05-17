@@ -54,6 +54,7 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
+import seaborn as sns
 import pandas as pd
 from tqdm import tqdm
 
@@ -71,11 +72,17 @@ from snorkel.labeling import labeling_function, LFAnalysis
 from snorkel.labeling.model import LabelModel, MajorityLabelVoter
 from snorkel.labeling import PandasLFApplier
 
+from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, average_precision_score
+
 print("All imports successful!")
 print(f"Snorkel version: {snorkel.__version__}")
 print(f"Transformers version: {transformers.__version__}")
 print(f"Torch version: {torch.__version__}")
-print(f"OpenCV version: {cv2.__version__}")"""))
+print(f"OpenCV version: {cv2.__version__}")
+
+# Set plot style
+sns.set_theme(style="whitegrid", palette="muted")
+plt.rcParams["figure.dpi"] = 100"""))
 
 # ============================================================
 # SECTION 2: Dataset Download & Exploration
@@ -500,7 +507,16 @@ if gt_mask.sum() > 0:
         if lf_mask.sum() > 0:
             lf_acc = (L_train[gt_mask, i][lf_mask] == gt_labels[lf_mask]).mean()
             lf_cov = lf_mask.mean()
-            print(f"    {lf.name}: acc={lf_acc:.1%}, cov={lf_cov:.1%}")"""))
+            print(f"    {lf.name}: acc={lf_acc:.1%}, cov={lf_cov:.1%}")
+
+    # Confusion matrix: LabelModel predictions vs ground truth
+    fig, ax = plt.subplots(figsize=(8, 6))
+    cm = confusion_matrix(gt_labels, preds[gt_mask], labels=[0, 1, 2])
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["WBC", "RBC", "Platelets"])
+    disp.plot(ax=ax, cmap="Blues", values_format="d")
+    ax.set_title("LabelModel Predictions vs Ground Truth")
+    plt.tight_layout()
+    plt.show()"""))
 
 cells.append(make_code("""# LFAnalysis details
 # Call without Y (ground truth) since not all proposals have GT labels
@@ -519,6 +535,25 @@ lf_summary["Conflicts"].plot(kind="bar", ax=axes[1])
 axes[1].set_title("LF Conflicts")
 axes[1].set_ylabel("Conflicts")
 axes[1].tick_params(axis="x", rotation=45)
+plt.tight_layout()
+plt.show()
+
+# Pairwise LF agreement heatmap
+n_lfs = L_train.shape[1]
+agreement = np.zeros((n_lfs, n_lfs))
+for i in range(n_lfs):
+    for j in range(n_lfs):
+        both_voted = (L_train[:, i] != ABSTAIN) & (L_train[:, j] != ABSTAIN)
+        if both_voted.sum() > 0:
+            agreement[i, j] = (L_train[both_voted, i] == L_train[both_voted, j]).mean()
+        else:
+            agreement[i, j] = 0
+
+fig, ax = plt.subplots(figsize=(8, 6))
+lf_names = [lf.name.replace("lf_", "") for lf in lfs]
+sns.heatmap(agreement, annot=True, fmt=".2f", xticklabels=lf_names, yticklabels=lf_names,
+            cmap="YlOrRd", vmin=0, vmax=1, ax=ax)
+ax.set_title("Pairwise LF Agreement (when both vote)")
 plt.tight_layout()
 plt.show()
 
@@ -894,7 +929,31 @@ print("(Training may take 5-15 minutes depending on GPU)")
 results = trainer.train()
 
 print("\\nTraining complete!")
-print(f"Final loss: {results.training_loss:.4f}")"""))
+print(f"Final loss: {results.training_loss:.4f}")
+
+# Plot training loss curve
+log_history = trainer.state.log_history
+train_steps = [entry["step"] for entry in log_history if "loss" in entry and "eval_loss" not in entry]
+train_losses = [entry["loss"] for entry in log_history if "loss" in entry and "eval_loss" not in entry]
+eval_steps = [entry["step"] for entry in log_history if "eval_loss" in entry]
+eval_losses = [entry["eval_loss"] for entry in log_history if "eval_loss" in entry]
+
+fig, ax = plt.subplots(figsize=(10, 5))
+if train_steps:
+    ax.plot(train_steps, train_losses, "b-o", markersize=3, label="Training loss")
+if eval_steps:
+    ax.plot(eval_steps, eval_losses, "r-s", markersize=4, label="Validation loss")
+ax.set_xlabel("Training step")
+ax.set_ylabel("Loss")
+ax.set_title("DETR Training Progress")
+ax.legend()
+ax.grid(True, alpha=0.3)
+plt.tight_layout()
+plt.show()
+
+if eval_losses:
+    print(f"Best validation loss: {min(eval_losses):.4f} at step {eval_steps[eval_losses.index(min(eval_losses))]}")
+print(f"Total training steps: {len(train_steps)}")"""))
 
 cells.append(make_code("""# Save the fine-tuned model
 model.save_pretrained("detr_bccd_weak/final")
@@ -972,7 +1031,35 @@ for cat in coco_gt.dataset["categories"]:
     coco_eval.evaluate()
     coco_eval.accumulate()
     ap50 = coco_eval.stats[1]
-    print(f"  {cat['name']}: {ap50:.3f}")"""))
+    print(f"  {cat['name']}: {ap50:.3f}")
+
+# Precision-Recall curves per class
+print("\\nPlotting Precision-Recall curves...")
+fig, ax = plt.subplots(figsize=(10, 8))
+colors_pr = ["cyan", "yellow", "magenta"]
+for cat in coco_gt.dataset["categories"]:
+    cat_id = cat["id"]
+    gt_arr = np.zeros(len(val_dataset))
+    pred_scores = np.zeros(len(val_dataset))
+    for i, img in enumerate(val_dataset.coco["images"]):
+        img_anns = [a for a in val_dataset.coco["annotations"] if a["image_id"] == img["id"]]
+        gt_arr[i] = 1 if any(a["category_id"] == cat_id for a in img_anns) else 0
+        matches = [r for r in results_list if r["image_id"] == img["id"] and r["category_id"] == cat_id]
+        pred_scores[i] = max([r["score"] for r in matches]) if matches else 0
+    if gt_arr.sum() > 0 and len(np.unique(gt_arr)) > 1:
+        precision, recall, _ = precision_recall_curve(gt_arr, pred_scores)
+        ap = average_precision_score(gt_arr, pred_scores)
+        ax.plot(recall, precision, color=colors_pr[cat_id], lw=2,
+                label=f"{cat['name']} (AP={ap:.2f})")
+ax.set_xlabel("Recall")
+ax.set_ylabel("Precision")
+ax.set_title("Precision-Recall Curves per Class")
+ax.legend(loc="lower left")
+ax.grid(True, alpha=0.3)
+ax.set_xlim(0, 1)
+ax.set_ylim(0, 1)
+plt.tight_layout()
+plt.show()"""))
 
 cells.append(make_code("""# Visualize predictions
 model.eval()
@@ -1027,6 +1114,38 @@ for ax, fname in zip(axes.flat, sample_val_files):
 plt.suptitle("Predictions (GT=--lime, Predicted=Cyan/Yellow/Magenta)", fontsize=14)
 plt.tight_layout()
 plt.show()"""))
+
+cells.append(make_code("""# Error Analysis: False Positives and False Negatives
+print("\\n--- Error Analysis ---")
+print(f"\\nDetection summary:")
+print(f"  Total GT objects in val set: {sum(len(v) for v in val_dataset.annotations_by_image.values())}")
+print(f"  Total predictions: {len(results_list)}")
+print(f"  Predictions per class:")
+for cat_id, cat_name in CLASS_NAMES.items():
+    n_pred = sum(1 for r in results_list if r["category_id"] == cat_id)
+    print(f"    {cat_name}: {n_pred}")
+
+# Show images with most false positives
+img_pred_counts = {}
+for r in results_list:
+    img_pred_counts[r["image_id"]] = img_pred_counts.get(r["image_id"], 0) + 1
+if img_pred_counts:
+    worst_img_id = max(img_pred_counts, key=img_pred_counts.get)
+    worst_img = [i for i in val_dataset.coco["images"] if i["id"] == worst_img_id][0]
+    print(f"\\nImage with most predictions: {worst_img['file_name']} ({img_pred_counts[worst_img_id]} preds)")
+
+# Confidence histogram of predictions
+if results_list:
+    fig, ax = plt.subplots(figsize=(10, 4))
+    scores = [r["score"] for r in results_list]
+    ax.hist(scores, bins=30, alpha=0.7, color="steelblue", edgecolor="white")
+    ax.set_xlabel("Detection confidence")
+    ax.set_ylabel("Count")
+    ax.set_title(f"Prediction Confidence Distribution ({len(results_list)} total detections)")
+    ax.axvline(x=0.5, color="red", linestyle="--", alpha=0.5, label="Confidence threshold=0.3")
+    ax.legend()
+    plt.tight_layout()
+    plt.show()"""))
 
 cells.append(make_code("""# Final summary
 print("\\n" + "="*60)
