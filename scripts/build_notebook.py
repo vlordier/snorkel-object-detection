@@ -415,6 +415,11 @@ def lf_background(row):
     mean_std = (row.std_r + row.std_g + row.std_b) / 3
     if mean_std < 15 and row.edge_density < 10:
         return ABSTAIN
+    # Not background: use color heuristics
+    if row.mean_r > 100 and row.mean_b < 80:
+        return RBC
+    if row.mean_b > row.mean_r * 0.8 and row.area > 2000:
+        return WBC
     return ABSTAIN
 
 lfs = [lf_size, lf_color_rbc, lf_color_wbc, lf_aspect_ratio, lf_edge_density, lf_background]
@@ -782,6 +787,8 @@ class BCCDDataset(Dataset):
         for k in encoding:
             if isinstance(encoding[k], torch.Tensor) and encoding[k].dim() > 0:
                 encoding[k] = encoding[k].squeeze(0)
+        encoding["orig_size"] = torch.tensor([image.shape[0], image.shape[1]])
+        encoding["image_id"] = img_info["id"]
         return encoding
 
 processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
@@ -863,7 +870,9 @@ def collate_fn(batch):
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     pixel_mask = torch.stack([item["pixel_mask"] for item in batch])
     labels = [item["labels"] for item in batch]
-    return {"pixel_values": pixel_values, "pixel_mask": pixel_mask, "labels": labels}
+    orig_sizes = torch.stack([item["orig_size"] for item in batch])
+    image_ids = [item["image_id"] for item in batch]
+    return {"pixel_values": pixel_values, "pixel_mask": pixel_mask, "labels": labels, "orig_sizes": orig_sizes, "image_ids": image_ids}
 
 trainer = Trainer(
     model=model,
@@ -912,22 +921,18 @@ with torch.no_grad():
     for batch in DataLoader(val_dataset, batch_size=4, collate_fn=collate_fn):
         pixel_values = batch["pixel_values"].to(device)
         pixel_mask = batch["pixel_mask"].to(device)
+        orig_sizes = batch["orig_sizes"].to(device)
+        image_ids = batch["image_ids"]
         outputs = model(pixel_values=pixel_values, pixel_mask=pixel_mask)
-        # Decode predictions
-        target_sizes = []
-        for i in range(pixel_values.shape[0]):
-            h = pixel_values.shape[2]  # original size from processor
-            w = pixel_values.shape[3]
-            target_sizes.append([h, w])
 
         processed = processor.post_process_object_detection(
-            outputs, threshold=0.3, target_sizes=torch.tensor(target_sizes).to(device)
+            outputs, threshold=0.3, target_sizes=orig_sizes
         )
 
         for i, result in enumerate(processed):
             for score, label, box in zip(result["scores"], result["labels"], result["boxes"]):
                 results_list.append({
-                    "image_id": val_dataset.coco["images"][i]["id"],
+                    "image_id": image_ids[i],
                     "category_id": int(label),
                     "bbox": box.tolist(),
                     "score": float(score),
