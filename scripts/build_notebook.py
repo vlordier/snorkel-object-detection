@@ -148,7 +148,7 @@ for cls, count in class_counts.items():
 # Image statistics
 widths = [ann["width"] for ann in all_annotations.values()]
 heights = [ann["height"] for ann in all_annotations.values()]
-print(f"\\nImage sizes: {min(widths)}x{min(heights)} to {max(widths)}x{max(heights)}"""))
+print(f"\\nImage sizes: {min(widths)}x{min(heights)} to {max(widths)}x{max(heights)}")"""))
 
 cells.append(make_code("""# Visualize sample images with ground truth boxes
 def visualize_image(filename, ax):
