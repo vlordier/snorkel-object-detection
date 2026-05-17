@@ -1,4 +1,4 @@
-"""Build the snorkel BCCD object detection tutorial notebook."""
+"""Build the snorkel VOC object detection tutorial notebook."""
 
 import json
 
@@ -23,22 +23,21 @@ cells = []
 # ============================================================
 # SECTION 1: Setup & Installation
 # ============================================================
-cells.append(make_md("""# Snorkel for Object Detection: Weak Supervision on BCCD Blood Cell Dataset
+cells.append(make_md("""# Snorkel for Object Detection: Weak Supervision on Pascal VOC 2012
 
 This tutorial demonstrates how to use **Snorkel** (a programmatic data labeling framework) to bootstrap object detection with weak supervision.
 
 ## Pipeline Overview
 
 ```
-BCCD images → Selective Search proposals → Snorkel LFs → LabelModel
+VOC 2012 images → Selective Search proposals → Snorkel LFs → LabelModel
 → pseudo-boxes → COCO format → fine-tune DETR → evaluate mAP
 ```
 
-## Dataset: BCCD (Blood Cell Detection)
-
-- **3 classes:** WBC (White Blood Cells), RBC (Red Blood Cells), Platelets
-- **~364 images** with VOC-format XML annotations
-- Cells have distinct visual characteristics that make heuristic labeling possible"""))
+## Dataset: Pascal VOC 2012
+- **4 selected classes:** aeroplane, boat, bottle, pottedplant
+- **~11,530 images** with difficult but visually distinct objects
+- Each class has distinct visual properties (color, shape, position) suited to heuristic labeling"""))
 
 cells.append(make_code("""# @title Install dependencies
 !pip install -q snorkel transformers torch torchvision opencv-contrib-python matplotlib seaborn scikit-learn scipy pycocotools
@@ -89,31 +88,37 @@ plt.rcParams["figure.dpi"] = 100"""))
 # ============================================================
 cells.append(make_md("""## 2. Dataset Download & Exploration
 
-We download the BCCD dataset and parse the VOC-format XML annotations."""))
+We download Pascal VOC 2012 and parse the XML annotations. We select 4 visually distinct classes (aeroplane, boat, bottle, pottedplant) that are well-suited to heuristic labeling."""))
 
-cells.append(make_code("""# @title Download BCCD Dataset
-DATA_DIR = "bccd_dataset"
+cells.append(make_code("""# @title Download Pascal VOC 2012
+import torchvision
+from torchvision.datasets import VOCDetection
 
-if not os.path.exists(DATA_DIR):
-    !git clone https://github.com/Shenggan/BCCD_Dataset.git {DATA_DIR}
-    print("Dataset downloaded!")
+DATA_DIR = "voc_dataset"
+VOC_ROOT = os.path.join(DATA_DIR, "VOCdevkit")
+
+if not os.path.exists(VOC_ROOT):
+    print("Downloading Pascal VOC 2012 (~2GB)...")
+    voc_dataset = VOCDetection(root=DATA_DIR, year="2012", image_set="trainval", download=True)
+    print("Download complete!")
 else:
-    print("Dataset already exists!")
+    print("VOC dataset already exists!")
+
+# Set image and annotation directories
+IMAGES_DIR = os.path.join(VOC_ROOT, "VOC2012", "JPEGImages")
+ANNOTATIONS_DIR = os.path.join(VOC_ROOT, "VOC2012", "Annotations")
 
 # Check structure
-!ls -la {DATA_DIR}/BCCD/"""))
+!ls {ANNOTATIONS_DIR} | head -5"""))
 
-cells.append(make_code("""# Parse annotations
-ANNOTATIONS_DIR = os.path.join(DATA_DIR, "BCCD", "Annotations")
-IMAGES_DIR = os.path.join(DATA_DIR, "BCCD", "JPEGImages")
-
-CLASS_MAP = {"WBC": 0, "RBC": 1, "Platelets": 2}
-CLASS_NAMES = {0: "WBC", 1: "RBC", 2: "Platelets"}
+cells.append(make_code("""# Parse VOC annotations (VOC format XML)
+CLASS_MAP = {"aeroplane": 0, "boat": 1, "bottle": 2, "pottedplant": 3}
+CLASS_NAMES = {0: "aeroplane", 1: "boat", 2: "bottle", 3: "pottedplant"}
 
 def parse_voc_xml(xml_path):
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    filename = root.find("filename").text
+    filename = root.find("filename").text + ".jpg"
     size = root.find("size")
     width = int(size.find("width").text)
     height = int(size.find("height").text)
@@ -141,10 +146,12 @@ for xml_path in xml_files:
     ann = parse_voc_xml(xml_path)
     all_annotations[ann["filename"]] = ann
 
-print(f"Total images with annotations: {len(all_annotations)}")
+print(f"Total images with selected class annotations: {len(all_annotations)}")
 
 # Class distribution
-class_counts = {"WBC": 0, "RBC": 0, "Platelets": 0}
+class_counts = {}
+for cls_name in CLASS_MAP:
+    class_counts[cls_name] = 0
 for ann in all_annotations.values():
     for box in ann["boxes"]:
         class_counts[box["class_name"]] += 1
@@ -165,7 +172,7 @@ def visualize_image(filename, ax):
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     ax.imshow(img)
     ann = all_annotations[filename]
-    colors = {"WBC": "cyan", "RBC": "yellow", "Platelets": "magenta"}
+    colors = {"aeroplane": "cyan", "boat": "yellow", "bottle": "magenta", "pottedplant": "lime"}
     for box in ann["boxes"]:
         xmin, ymin, xmax, ymax = box["bbox"]
         rect = patches.Rectangle(
@@ -182,7 +189,7 @@ fig, axes = plt.subplots(2, 3, figsize=(18, 12))
 for ax, fname in zip(axes.flat, sample_files):
     visualize_image(fname, ax)
     ax.axis("off")
-plt.suptitle("Sample images with GT boxes (Cyan=WBC, Yellow=RBC, Magenta=Platelets)", fontsize=14)
+plt.suptitle("Sample images with GT boxes (Cyan=Aeroplane, Yellow=Boat, Magenta=Bottle, Lime=Pottedplant)", fontsize=14)
 plt.tight_layout()
 plt.show()"""))
 
@@ -347,11 +354,11 @@ for ax, feat in zip(axes.flat, features_to_plot):
 plt.tight_layout()
 plt.show()"""))
 
-cells.append(make_code("""# Compute LF thresholds from data statistics (no magic numbers)
+cells.append(make_code("""# @title Compute LF thresholds from data statistics (no magic numbers)
+# Compute LF thresholds from data statistics (no magic numbers)
 pos_samples = df[df["best_iou"] > 0.5].copy()
 
 if len(pos_samples) > 0:
-    # Per-class statistics
     print("Per-class statistics for threshold computation:")
     class_stats = {}
     for cls_id, cls_name in CLASS_NAMES.items():
@@ -361,71 +368,82 @@ if len(pos_samples) > 0:
             total = means.sum() + 1e-10
             class_stats[cls_name] = {
                 "n": len(cls_df),
-                "red_ratio": (means["mean_r"] / total),
-                "blue_ratio": (means["mean_b"] / total),
+                "brightness": means.sum(),
+                "green_ratio": means["mean_g"] / total,
                 "area_median": cls_df["area"].median(),
                 "area_p25": cls_df["area"].quantile(0.25),
                 "area_p75": cls_df["area"].quantile(0.75),
                 "std_median": cls_df[["std_r", "std_g", "std_b"]].mean(axis=1).median(),
                 "aspect_median": cls_df["aspect_ratio"].median(),
+                "aspect_p25": cls_df["aspect_ratio"].quantile(0.25),
+                "aspect_p75": cls_df["aspect_ratio"].quantile(0.75),
+                "center_y_median": cls_df["center_y"].median(),
             }
             print(f"  {cls_name} (n={class_stats[cls_name]['n']}):")
-            print(f"    R ratio={class_stats[cls_name]['red_ratio']:.3f}, B ratio={class_stats[cls_name]['blue_ratio']:.3f}")
+            print(f"    Brightness={class_stats[cls_name]['brightness']:.0f}, Green ratio={class_stats[cls_name]['green_ratio']:.3f}")
             print(f"    Area: median={class_stats[cls_name]['area_median']:.0f}, p25={class_stats[cls_name]['area_p25']:.0f}, p75={class_stats[cls_name]['area_p75']:.0f}")
-            print(f"    Std: median={class_stats[cls_name]['std_median']:.1f}, Aspect: median={class_stats[cls_name]['aspect_median']:.2f}")
+            print(f"    Aspect: median={class_stats[cls_name]['aspect_median']:.2f}, p25={class_stats[cls_name]['aspect_p25']:.2f}, p75={class_stats[cls_name]['aspect_p75']:.2f}")
+            print(f"    Center Y: median={class_stats[cls_name]['center_y_median']:.3f}")
 
-    # --- Define data-driven thresholds ---
-    # Use class_stats with fallbacks for missing classes
-    wbc_stats = class_stats.get("WBC")
-    rbc_stats = class_stats.get("RBC")
-    plt_stats = class_stats.get("Platelets")
+    # --- Compute data-driven thresholds ---
+    aero = class_stats.get("aeroplane")
+    boat = class_stats.get("boat")
+    bottle = class_stats.get("bottle")
+    plant = class_stats.get("pottedplant")
 
-    # Size thresholds
-    if rbc_stats and wbc_stats:
-        WBC_AREA_LOWER = int((rbc_stats["area_median"] + wbc_stats["area_median"]) / 2)
+    # Aspect ratio: bottle is narrow, boat is wide
+    if bottle and aero:
+        NARROW_AR = (bottle["aspect_p75"] + aero["aspect_p25"]) / 2
     else:
-        WBC_AREA_LOWER = 2000
-    if plt_stats and rbc_stats:
-        PLATELET_AREA_UPPER = int((plt_stats["area_median"] + rbc_stats["area_median"]) / 2)
-    elif rbc_stats:
-        PLATELET_AREA_UPPER = int(rbc_stats["area_p25"])
+        NARROW_AR = 0.6
+    if boat and aero:
+        WIDE_AR = (boat["aspect_p25"] + aero["aspect_p75"]) / 2
     else:
-        PLATELET_AREA_UPPER = 800
-    PLATELET_AREA_LOWER = int(max(50, plt_stats["area_p25"] * 0.5)) if plt_stats else 50
-    print(f"\\nComputed thresholds: WBC >= {WBC_AREA_LOWER}, RBC >= {PLATELET_AREA_UPPER}, Platelet >= {PLATELET_AREA_LOWER}")
+        WIDE_AR = 2.0
 
-    # Red ratio threshold: midpoint between WBC and RBC medians
-    if rbc_stats and wbc_stats:
-        RBC_RED_RATIO = (rbc_stats["red_ratio"] + wbc_stats["red_ratio"]) / 2
+    # Area: bottle small, large for aero/boat
+    if bottle and aero:
+        SMALL_AREA = int((bottle["area_p75"] + aero["area_p25"]) / 2)
     else:
-        RBC_RED_RATIO = 0.36
-    print(f"  Red ratio > {RBC_RED_RATIO:.3f} -> RBC")
+        SMALL_AREA = 3000
 
-    # Blue ratio threshold: midpoint between WBC and RBC medians  
-    if wbc_stats and rbc_stats:
-        WBC_BLUE_RATIO = (wbc_stats["blue_ratio"] + rbc_stats["blue_ratio"]) / 2
+    # Green ratio for pottedplant
+    if plant and aero:
+        GREEN_RATIO_THRESH = (plant["green_ratio"] + aero["green_ratio"]) / 2
     else:
-        WBC_BLUE_RATIO = 0.34
-    WBC_AREA_LOWER_STD = int(wbc_stats["area_p25"]) if wbc_stats else 1500
-    print(f"  Blue ratio > {WBC_BLUE_RATIO:.3f} + area > {WBC_AREA_LOWER_STD} -> WBC")
+        GREEN_RATIO_THRESH = 0.36
 
-    # Color std thresholds: boundary between WBC (high) and RBC (low)
-    WBC_STD_t = wbc_stats["std_median"] * 0.8 if wbc_stats else 25
-    RBC_STD_t = rbc_stats["std_median"] * 1.2 if rbc_stats else 15
-    print(f"  Std > {WBC_STD_t:.1f} -> WBC, Std < {RBC_STD_t:.1f} -> RBC (computed from class medians)")
-
-    # Aspect ratio thresholds
-    if rbc_stats and wbc_stats:
-        RBC_AR_UPPER = (rbc_stats["aspect_median"] + wbc_stats["aspect_median"]) / 2
-        WBC_AR_LOWER = RBC_AR_UPPER * 1.1
-        RBC_AR_LOWER = max(0.7, rbc_stats["aspect_median"] * 0.8)
+    # Brightness for white objects
+    if aero:
+        BRIGHT_THRESH = aero["brightness"] * 0.85
+    elif boat:
+        BRIGHT_THRESH = boat["brightness"] * 0.85
     else:
-        RBC_AR_UPPER = 1.4
-        WBC_AR_LOWER = 1.5
-        RBC_AR_LOWER = 0.7
-    print(f"  Aspect ratio: {RBC_AR_LOWER:.2f}-{RBC_AR_UPPER:.2f} -> RBC, > {WBC_AR_LOWER:.2f} -> WBC")
+        BRIGHT_THRESH = 550
 
-    # Visualize RGB distributions per class
+    # Position: upper for aeroplane, lower for boat/pottedplant
+    if aero:
+        UPPER_Y_THRESH = aero["center_y_median"] * 1.3
+    else:
+        UPPER_Y_THRESH = 0.4
+    if boat and plant:
+        LOWER_Y_THRESH = (boat["center_y_median"] + plant["center_y_median"]) / 2 * 0.85
+    else:
+        LOWER_Y_THRESH = 0.55
+
+    # Color std: white objects are uniform
+    UNIFORM_STD = 35
+
+    print(f"\\nComputed thresholds:")
+    print(f"  Narrow AR < {NARROW_AR:.2f} -> bottle")
+    print(f"  Wide AR > {WIDE_AR:.2f} -> boat")
+    print(f"  Small area < {SMALL_AREA} -> bottle")
+    print(f"  Green ratio > {GREEN_RATIO_THRESH:.3f} -> pottedplant")
+    print(f"  Brightness > {BRIGHT_THRESH:.0f} + upper (y<{UPPER_Y_THRESH:.2f}) -> aeroplane")
+    print(f"  Brightness > {BRIGHT_THRESH:.0f} + lower (y>{LOWER_Y_THRESH:.2f}) + wide -> boat")
+    print(f"  Color std < {UNIFORM_STD} + bright -> white object (aero/boat)")
+
+    # Per-class RGB distribution plot
     fig, axes = plt.subplots(1, 3, figsize=(15, 4))
     for i, (channel, color) in enumerate([("mean_r", "red"), ("mean_g", "green"), ("mean_b", "blue")]):
         for cls_id, cls_name in CLASS_NAMES.items():
@@ -439,18 +457,14 @@ if len(pos_samples) > 0:
     plt.tight_layout()
     plt.show()
 else:
-    # Fallback defaults if no GT proposals available
-    WBC_AREA_LOWER = 2000
-    PLATELET_AREA_UPPER = 800
-    PLATELET_AREA_LOWER = 50
-    RBC_RED_RATIO = 0.36
-    WBC_BLUE_RATIO = 0.34
-    WBC_AREA_LOWER_STD = 1500
-    WBC_STD_t = 25
-    RBC_STD_t = 15
-    RBC_AR_UPPER = 1.4
-    WBC_AR_LOWER = 1.5
-    RBC_AR_LOWER = 0.7
+    NARROW_AR = 0.6
+    WIDE_AR = 2.0
+    SMALL_AREA = 3000
+    GREEN_RATIO_THRESH = 0.36
+    BRIGHT_THRESH = 550
+    UPPER_Y_THRESH = 0.4
+    LOWER_Y_THRESH = 0.55
+    UNIFORM_STD = 35
     print("No GT proposals available. Using default thresholds.")"""))
 
 # ============================================================
@@ -460,23 +474,24 @@ cells.append(make_md("""## 5. Snorkel Labeling Functions
 
 We write 6 labeling functions that classify each proposal based on visual heuristics.
 
-**Labeling functions:**
+**4 classes, 6 LFs:**
 
 | LF | Heuristic | Logic |
 |---|---|---|
-| `lf_size` | Area thresholds | Uses median-based midpoints between classes |
-| `lf_red_ratio` | Normalized red ratio | R/(R+G+B) > data-driven threshold → RBC |
-| `lf_blue_ratio` | Normalized blue ratio | B/(R+G+B) > data-driven threshold + area → WBC |
-| `lf_aspect_ratio` | Shape | Round → RBC, Elongated → WBC (computed from class medians) |
-| `lf_color_std` | Color variance | High std → WBC, Low std → RBC (computed from class medians) |
-| `lf_position` | Spatial location | Central proposals with cell-like size → WBC/RBC |
+| `lf_aspect_ratio` | Shape | Narrow AR < threshold → bottle, Wide AR > threshold → boat |
+| `lf_green_dominant` | Color | G/(R+G+B) > threshold → pottedplant |
+| `lf_bright_upper` | Color + Position | High brightness + upper half → aeroplane |
+| `lf_white_boat` | Color + Position + Shape | High brightness + lower half + wide → boat |
+| `lf_bright_uniform` | Color + Texture | High brightness + low color std → white object (aero/boat) |
+| `lf_small_object` | Size | Small area + narrow-ish AR → bottle |
 
 **ABSTAIN** means the LF has no opinion — Snorkel's LabelModel handles this."""))
 
 cells.append(make_code("""# Define label constants
-WBC = 0
-RBC = 1
-PLATELET = 2
+AEROPLANE = 0
+BOAT = 1
+BOTTLE = 2
+POTTEDPLANT = 3
 ABSTAIN = -1
 
 # Clean feature names for Snorkel (no spaces/dots)
@@ -484,59 +499,49 @@ df_lf = df.copy()
 df_lf.columns = [c.replace(".", "_").replace(" ", "_") for c in df_lf.columns]
 
 @labeling_function()
-def lf_size(row):
-    if row.area > WBC_AREA_LOWER:
-        return WBC
-    elif row.area > PLATELET_AREA_UPPER:
-        return RBC
-    elif row.area > PLATELET_AREA_LOWER:
-        return PLATELET
-    else:
-        return ABSTAIN
-
-@labeling_function()
-def lf_red_ratio(row):
-    total = row.mean_r + row.mean_g + row.mean_b + 1e-10
-    if total > 0 and (row.mean_r / total) > RBC_RED_RATIO and row.area > PLATELET_AREA_UPPER:
-        return RBC
-    return ABSTAIN
-
-@labeling_function()
-def lf_blue_ratio(row):
-    total = row.mean_r + row.mean_g + row.mean_b + 1e-10
-    if total > 0 and (row.mean_b / total) > WBC_BLUE_RATIO and row.area > WBC_AREA_LOWER_STD:
-        return WBC
-    return ABSTAIN
-
-@labeling_function()
 def lf_aspect_ratio(row):
-    if RBC_AR_LOWER < row.aspect_ratio < RBC_AR_UPPER:
-        return RBC
-    elif row.aspect_ratio > WBC_AR_LOWER:
-        return WBC
+    if row.aspect_ratio < NARROW_AR:
+        return BOTTLE
+    elif row.aspect_ratio > WIDE_AR:
+        return BOAT
     return ABSTAIN
 
 @labeling_function()
-def lf_color_std(row):
+def lf_green_dominant(row):
+    total = row.mean_r + row.mean_g + row.mean_b + 1e-10
+    if total > 0 and (row.mean_g / total) > GREEN_RATIO_THRESH:
+        return POTTEDPLANT
+    return ABSTAIN
+
+@labeling_function()
+def lf_bright_upper(row):
+    brightness = row.mean_r + row.mean_g + row.mean_b
+    if brightness > BRIGHT_THRESH and row.center_y < UPPER_Y_THRESH:
+        return AEROPLANE
+    return ABSTAIN
+
+@labeling_function()
+def lf_white_boat(row):
+    brightness = row.mean_r + row.mean_g + row.mean_b
+    if brightness > BRIGHT_THRESH and row.center_y > LOWER_Y_THRESH and row.aspect_ratio > WIDE_AR:
+        return BOAT
+    return ABSTAIN
+
+@labeling_function()
+def lf_bright_uniform(row):
+    brightness = row.mean_r + row.mean_g + row.mean_b
     mean_std = (row.std_r + row.std_g + row.std_b) / 3
-    if mean_std > WBC_STD_t and row.area > WBC_AREA_LOWER_STD:
-        return WBC
-    elif mean_std < RBC_STD_t and row.area > PLATELET_AREA_UPPER:
-        return RBC
+    if brightness > BRIGHT_THRESH and mean_std < UNIFORM_STD:
+        return AEROPLANE
     return ABSTAIN
 
 @labeling_function()
-def lf_position(row):
-    if row.center_x < 0.05 or row.center_x > 0.95 or row.center_y < 0.05 or row.center_y > 0.95:
-        return ABSTAIN
-    if 0.25 < row.center_x < 0.75 and 0.25 < row.center_y < 0.75:
-        if row.area > 3000:
-            return WBC
-        elif row.area > 800:
-            return RBC
+def lf_small_object(row):
+    if row.area < SMALL_AREA and row.aspect_ratio < 0.9:
+        return BOTTLE
     return ABSTAIN
 
-lfs = [lf_size, lf_red_ratio, lf_blue_ratio, lf_aspect_ratio, lf_color_std, lf_position]
+lfs = [lf_aspect_ratio, lf_green_dominant, lf_bright_upper, lf_white_boat, lf_bright_uniform, lf_small_object]
 
 # Apply LFs
 applier = PandasLFApplier(lfs)
@@ -567,8 +572,7 @@ def plot_lf_decisions(image_path, proposals_df, lf_idx, n_proposals=10):
     plt.tight_layout()
     plt.show()
 
-print("Showing decisions for lf_red_ratio (index 1):")
-# The lf_red_ratio is the 2nd LF (index 1)
+print("Showing decisions for lf_green_dominant (index 1):")
 plot_lf_decisions(
     os.path.join(IMAGES_DIR, all_filenames[0]),
     df_lf[df_lf["filename"] == all_filenames[0]],
@@ -583,7 +587,7 @@ cells.append(make_md("""## 6. Label Model
 We train Snorkel's `LabelModel` to combine the labeling functions into a single probabilistic label per proposal."""))
 
 cells.append(make_code("""# @title Train LabelModel
-label_model = LabelModel(cardinality=3, verbose=True)
+label_model = LabelModel(cardinality=4, verbose=True)
 label_model.fit(L_train, n_epochs=500, lr=0.01, l2=0.01, seed=123)
 
 # Get probabilistic labels
@@ -622,8 +626,8 @@ if gt_mask.sum() > 0:
 
     # Confusion matrix: LabelModel predictions vs ground truth
     fig, ax = plt.subplots(figsize=(8, 6))
-    cm = confusion_matrix(gt_labels, preds[gt_mask], labels=[0, 1, 2])
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["WBC", "RBC", "Platelets"])
+    cm = confusion_matrix(gt_labels, preds[gt_mask], labels=[0, 1, 2, 3])
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=["Aeroplane", "Boat", "Bottle", "Pottedplant"])
     disp.plot(ax=ax, cmap="Blues", values_format="d")
     ax.set_title("LabelModel Predictions vs Ground Truth")
     plt.tight_layout()
@@ -760,7 +764,7 @@ def visualize_pseudo_labels(fname, ax, pos_df, title_prefix=""):
 
     # Pseudo-label boxes
     img_df = pos_df[pos_df["filename"] == fname]
-    colors = {"WBC": "cyan", "RBC": "yellow", "Platelets": "magenta"}
+    colors = {"aeroplane": "cyan", "boat": "yellow", "bottle": "magenta", "pottedplant": "lime"}
     for _, row in img_df.iterrows():
         prop = row["proposal"]
         rect = patches.Rectangle(
@@ -809,9 +813,10 @@ def build_coco_json(pos_df, filenames, output_path="pseudo_annotations.json"):
         "images": [],
         "annotations": [],
         "categories": [
-            {"id": 0, "name": "WBC"},
-            {"id": 1, "name": "RBC"},
-            {"id": 2, "name": "Platelets"},
+            {"id": 0, "name": "aeroplane"},
+            {"id": 1, "name": "boat"},
+            {"id": 2, "name": "bottle"},
+            {"id": 3, "name": "pottedplant"},
         ],
     }
     ann_id = 0
@@ -857,9 +862,10 @@ def build_gt_coco(filenames, output_path="gt_annotations.json"):
         "images": [],
         "annotations": [],
         "categories": [
-            {"id": 0, "name": "WBC"},
-            {"id": 1, "name": "RBC"},
-            {"id": 2, "name": "Platelets"},
+            {"id": 0, "name": "aeroplane"},
+            {"id": 1, "name": "boat"},
+            {"id": 2, "name": "bottle"},
+            {"id": 3, "name": "pottedplant"},
         ],
     }
     ann_id = 0
@@ -887,7 +893,7 @@ def build_gt_coco(filenames, output_path="gt_annotations.json"):
 _ = build_gt_coco(all_filenames, "weak_annotations/gt.json")"""))
 
 cells.append(make_code("""# Create PyTorch Dataset for DETR
-class BCCDDataset(Dataset):
+class VOCDataset(Dataset):
     def __init__(self, coco_json_path, img_dir, image_processor):
         with open(coco_json_path) as f:
             self.coco = json.load(f)
@@ -962,8 +968,8 @@ val_coco = subset_coco(coco_data, val_ids)
 save_subset_coco(train_coco, "weak_annotations/train_coco.json")
 save_subset_coco(val_coco, "weak_annotations/val_coco.json")
 
-train_dataset = BCCDDataset("weak_annotations/train_coco.json", IMAGES_DIR, processor)
-val_dataset = BCCDDataset("weak_annotations/val_coco.json", IMAGES_DIR, processor)
+train_dataset = VOCDataset("weak_annotations/train_coco.json", IMAGES_DIR, processor)
+val_dataset = VOCDataset("weak_annotations/val_coco.json", IMAGES_DIR, processor)
 
 print(f"Train dataset: {len(train_dataset)} images, "
       f"{sum(len(v) for v in train_dataset.annotations_by_image.values())} annotations")
@@ -988,7 +994,7 @@ print(f"Using device: {device}")
 
 model = DetrForObjectDetection.from_pretrained(
     "facebook/detr-resnet-50",
-    num_labels=3,
+    num_labels=4,
     ignore_mismatched_sizes=True,
 )
 model.to(device)
@@ -996,7 +1002,7 @@ print(f"Model loaded: {sum(p.numel() for p in model.parameters()):,} parameters"
 
 cells.append(make_code("""# @title Training Arguments
 training_args = TrainingArguments(
-    output_dir="detr_bccd_weak",
+    output_dir="detr_voc_weak",
     per_device_train_batch_size=4,
     per_device_eval_batch_size=4,
     num_train_epochs=10,
@@ -1067,9 +1073,9 @@ if eval_losses:
 print(f"Total training steps: {len(train_steps)}")"""))
 
 cells.append(make_code("""# Save the fine-tuned model
-model.save_pretrained("detr_bccd_weak/final")
-processor.save_pretrained("detr_bccd_weak/final")
-print("Model saved to detr_bccd_weak/final/")"""))
+model.save_pretrained("detr_voc_weak/final")
+processor.save_pretrained("detr_voc_weak/final")
+print("Model saved to detr_voc_weak/final/")"""))
 
 # ============================================================
 # SECTION 10: Evaluation
@@ -1147,7 +1153,7 @@ for cat in coco_gt.dataset["categories"]:
 # Precision-Recall curves per class
 print("\\nPlotting Precision-Recall curves...")
 fig, ax = plt.subplots(figsize=(10, 8))
-colors_pr = ["cyan", "yellow", "magenta"]
+colors_pr = ["cyan", "yellow", "magenta", "lime"]
 for cat in coco_gt.dataset["categories"]:
     cat_id = cat["id"]
     gt_arr = np.zeros(len(val_dataset))
@@ -1179,7 +1185,7 @@ sample_val_files = [f for f in all_filenames if f in val_fnames][:10]
 n_cols = 5
 n_rows = (len(sample_val_files) + n_cols - 1) // n_cols
 fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows))
-colors = {0: "cyan", 1: "yellow", 2: "magenta"}
+colors = {0: "cyan", 1: "yellow", 2: "magenta", 3: "lime"}
 
 for ax, fname in zip(axes.flat, sample_val_files):
     img_path = os.path.join(IMAGES_DIR, fname)
@@ -1260,17 +1266,17 @@ if results_list:
 
 cells.append(make_code("""# Final summary
 print("\\n" + "="*60)
-print("SNORKEL + DETR FOR BCCD OBJECT DETECTION: SUMMARY")
+print("SNORKEL + DETR FOR PASCAL VOC OBJECT DETECTION: SUMMARY")
 print("="*60)
-print(f"\\nDataset: BCCD ({len(all_annotations)} images, 3 classes)")
+print(f"\\nDataset: Pascal VOC 2012 ({len(all_annotations)} images, 4 classes)")
 print(f"Region proposals: Selective Search (up to {MAX_PROPOSALS} per image)")
 print(f"Labeling functions: {len(lfs)} heuristic LFs")
-print(f"  - lf_size, lf_red_ratio, lf_blue_ratio")
-print(f"  - lf_aspect_ratio, lf_color_std, lf_position")
+print(f"  - lf_aspect_ratio, lf_green_dominant, lf_bright_upper")
+print(f"  - lf_white_boat, lf_bright_uniform, lf_small_object")
 print(f"LabelModel: Trained on {len(df_lf)} proposals")
 print(f"  - High-confidence pseudo-labels: {len(pos_df_nms)} (thresh={CONFIDENCE_THRESHOLD})")
 print(f"  - Quality: {(len(pos_gt)/max(len(pos_df_nms),1)):.1%} match GT objects")
-print(f"DETR Model: facebook/detr-resnet-50")
+print(f"DETR Model: facebook/detr-resnet-50 fine-tuned on pseudo-labels")
 print(f"  - Training: 10 epochs on weak labels")
 print(f"  - Eval: mAP@0.5 = {coco_eval.stats[1]:.3f}")
 
@@ -1283,7 +1289,7 @@ cells.append(make_md("""## Conclusion
 This tutorial demonstrated how to use **Snorkel** for programmatic data labeling in an object detection pipeline:
 
 1. **Region proposals** via Selective Search generated candidate boxes
-2. **Labeling functions** encoded domain knowledge about blood cell appearance
+2. **Labeling functions** encoded domain knowledge about Pascal VOC object appearance
 3. **LabelModel** combined weak signals into probabilistic labels
 4. **Pseudo-labels** were filtered and used to train a **DETR** object detector
 5. **Evaluation** showed the model learned meaningful detection from weak supervision
@@ -1291,7 +1297,7 @@ This tutorial demonstrated how to use **Snorkel** for programmatic data labeling
 ### Next Steps
 - Add more labeling functions targeting specific failure modes
 - Use active learning to prioritize proposals the LabelModel is uncertain about
-- Scale to more images (BCCD is small — try with all 364 images)
+- Scale to more Pascal VOC 2012 images (~11k available)
 - Try different backbones (YOLO, Faster R-CNN) with the same weak labels"""))
 
 # ============================================================
@@ -1314,7 +1320,7 @@ notebook = {
     "nbformat_minor": 5,
 }
 
-output_path = "notebooks/snorkel_bccd_object_detection.ipynb"
+output_path = "notebooks/snorkel_voc_object_detection.ipynb"
 with open(output_path, "w") as f:
     json.dump(notebook, f, indent=1)
 
