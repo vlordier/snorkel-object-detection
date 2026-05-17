@@ -10,3 +10,9 @@ env/
 *.checkpoint
 *.pth
 *.pt
+
+# Generated artifacts
+bccd_dataset/
+detr_bccd_weak/
+weak_annotations/
+/tmp/
