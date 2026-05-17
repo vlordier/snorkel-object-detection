@@ -47,9 +47,6 @@ cells.append(make_code("""# @title Install dependencies
 cells.append(make_code("""import os
 import json
 import xml.etree.ElementTree as ET
-import urllib.request
-import zipfile
-import shutil
 import random
 from pathlib import Path
 
@@ -57,7 +54,6 @@ import cv2
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
-import seaborn as sns
 import pandas as pd
 from tqdm import tqdm
 
@@ -375,11 +371,11 @@ df_lf.columns = [c.replace(".", "_").replace(" ", "_") for c in df_lf.columns]
 
 @labeling_function()
 def lf_size(row):
-    if row.area > 5000:
+    if row.area > 3000:
         return WBC
     elif row.area > 800:
         return RBC
-    elif row.area > 100:
+    elif row.area > 50:
         return PLATELET
     else:
         return ABSTAIN
@@ -400,7 +396,7 @@ def lf_color_wbc(row):
 def lf_aspect_ratio(row):
     if row.aspect_ratio > 0.7 and row.aspect_ratio < 1.4:
         return RBC
-    elif row.aspect_ratio > 1.8:
+    elif row.aspect_ratio > 1.5:
         return WBC
     return ABSTAIN
 
@@ -411,18 +407,17 @@ def lf_edge_density(row):
     return ABSTAIN
 
 @labeling_function()
-def lf_background(row):
-    mean_std = (row.std_r + row.std_g + row.std_b) / 3
-    if mean_std < 15 and row.edge_density < 10:
+def lf_position(row):
+    if row.center_x < 0.05 or row.center_x > 0.95 or row.center_y < 0.05 or row.center_y > 0.95:
         return ABSTAIN
-    # Not background: use color heuristics
-    if row.mean_r > 100 and row.mean_b < 80:
-        return RBC
-    if row.mean_b > row.mean_r * 0.8 and row.area > 2000:
-        return WBC
+    if 0.25 < row.center_x < 0.75 and 0.25 < row.center_y < 0.75:
+        if row.area > 3000:
+            return WBC
+        elif row.area > 800:
+            return RBC
     return ABSTAIN
 
-lfs = [lf_size, lf_color_rbc, lf_color_wbc, lf_aspect_ratio, lf_edge_density, lf_background]
+lfs = [lf_size, lf_color_rbc, lf_color_wbc, lf_aspect_ratio, lf_edge_density, lf_position]
 
 # Apply LFs
 applier = PandasLFApplier(lfs)
@@ -444,7 +439,8 @@ def plot_lf_decisions(image_path, proposals_df, lf_idx, n_proposals=10):
         crop = img[row.proposal[1]:row.proposal[3], row.proposal[0]:row.proposal[2]]
         crop_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
         ax.imshow(crop_rgb)
-        lf_label = L_train[list(proposals_df.index).index(row.name)][lf_idx]
+        row_idx = df_lf.index.get_loc(row.name)
+        lf_label = L_train[row_idx, lf_idx]
         label_name = CLASS_NAMES.get(lf_label, "ABSTAIN") if lf_label != -1 else "ABSTAIN"
         gt_name = CLASS_NAMES.get(row.best_class, "BG") if row.best_class != -1 else "BG"
         ax.set_title(f"LF: {label_name} | GT: {gt_name}", fontsize=9)
@@ -556,7 +552,7 @@ cells.append(make_md("""## 7. Pseudo-Label Assignment
 We assign weak labels to proposals and apply Non-Maximum Suppression (NMS) to remove redundant boxes."""))
 
 cells.append(make_code("""# @title Assign Pseudo-Labels
-CONFIDENCE_THRESHOLD = 0.6
+CONFIDENCE_THRESHOLD = 0.7
 
 # Filter high-confidence positive proposals
 pos_mask = df_lf["snorkel_confidence"] >= CONFIDENCE_THRESHOLD
@@ -570,14 +566,13 @@ cells.append(make_code("""# Non-Maximum Suppression
 def nms(proposals, scores, iou_threshold=0.5):
     if len(proposals) == 0:
         return []
-    boxes = np.array(proposals, dtype=np.float32)
-    scores = np.array(scores)
+    boxes_xywh = [[b[0], b[1], b[2] - b[0], b[3] - b[1]] for b in proposals]
+    scores_arr = np.array(scores)
     indices = cv2.dnn.NMSBoxes(
-        boxes.tolist(), scores.tolist(), score_threshold=0.0, nms_threshold=iou_threshold
+        boxes_xywh, scores_arr.tolist(), score_threshold=0.0, nms_threshold=iou_threshold
     )
     if indices is None or len(indices) == 0:
         return []
-    # cv2.dnn.NMSBoxes returns different shapes in different versions
     if hasattr(indices, "flatten"):
         return indices.flatten().tolist()
     if len(indices.shape) > 1:
@@ -851,7 +846,7 @@ training_args = TrainingArguments(
     output_dir="detr_bccd_weak",
     per_device_train_batch_size=4,
     per_device_eval_batch_size=4,
-    num_train_epochs=15,
+    num_train_epochs=10,
     evaluation_strategy="steps",
     eval_steps=20,
     logging_steps=10,
@@ -955,13 +950,26 @@ coco_eval.summarize()
 print(f"\\n{'='*50}")
 print(f"Final Results:")
 print(f"  mAP@0.5: {coco_eval.stats[1]:.3f}")
-print(f"  mAP@0.5:0.95: {coco_eval.stats[0]:.3f}")"""))
+print(f"  mAP@0.5:0.95: {coco_eval.stats[0]:.3f}")
+
+# Per-class metrics
+print(f"\\nPer-class AP@0.5:")
+for cat in coco_gt.dataset["categories"]:
+    cat_id = cat["id"]
+    coco_eval.params.catIds = [cat_id]
+    coco_eval.params.imgIds = val_img_ids
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    ap50 = coco_eval.stats[1]
+    print(f"  {cat['name']}: {ap50:.3f}")"""))
 
 cells.append(make_code("""# Visualize predictions
 model.eval()
-sample_val_files = [f for f in all_filenames if f in val_fnames][:4]
+sample_val_files = [f for f in all_filenames if f in val_fnames][:10]
 
-fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+n_cols = 5
+n_rows = (len(sample_val_files) + n_cols - 1) // n_cols
+fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows))
 colors = {0: "cyan", 1: "yellow", 2: "magenta"}
 
 for ax, fname in zip(axes.flat, sample_val_files):
@@ -1017,12 +1025,12 @@ print(f"\\nDataset: BCCD ({len(all_annotations)} images, 3 classes)")
 print(f"Region proposals: Selective Search (up to {MAX_PROPOSALS} per image)")
 print(f"Labeling functions: {len(lfs)} heuristic LFs")
 print(f"  - lf_size, lf_color_rbc, lf_color_wbc")
-print(f"  - lf_aspect_ratio, lf_edge_density, lf_background")
+print(f"  - lf_aspect_ratio, lf_edge_density, lf_position")
 print(f"LabelModel: Trained on {len(df_lf)} proposals")
 print(f"  - High-confidence pseudo-labels: {len(pos_df_nms)} (thresh={CONFIDENCE_THRESHOLD})")
 print(f"  - Quality: {(len(pos_gt)/max(len(pos_df_nms),1)):.1%} match GT objects")
 print(f"DETR Model: facebook/detr-resnet-50")
-print(f"  - Training: 15 epochs on weak labels")
+print(f"  - Training: 10 epochs on weak labels")
 print(f"  - Eval: mAP@0.5 = {coco_eval.stats[1]:.3f}")
 
 print(f"\\n{'='*60}")
