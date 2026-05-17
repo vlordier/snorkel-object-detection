@@ -57,8 +57,9 @@ import matplotlib.patches as patches
 import pandas as pd
 from tqdm import tqdm
 
+from functools import partial
+
 import torch
-import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 
 import transformers
@@ -66,9 +67,9 @@ from transformers import DetrForObjectDetection, DetrImageProcessor
 from transformers import Trainer, TrainingArguments
 
 import snorkel
-from snorkel.labeling import labeling_function, LabelModel, MajorityLabelVoter
+from snorkel.labeling import labeling_function, LFAnalysis
+from snorkel.labeling.model import LabelModel, MajorityLabelVoter
 from snorkel.labeling import PandasLFApplier
-from snorkel.analysis import LFAnalysis
 
 print("All imports successful!")
 print(f"Snorkel version: {snorkel.__version__}")
@@ -97,7 +98,7 @@ else:
 
 cells.append(make_code("""# Parse annotations
 ANNOTATIONS_DIR = os.path.join(DATA_DIR, "BCCD", "Annotations")
-IMAGES_DIR = os.path.join(DATA_DIR, "BCCD", "Images")
+IMAGES_DIR = os.path.join(DATA_DIR, "BCCD", "JPEGImages")
 
 CLASS_MAP = {"WBC": 0, "RBC": 1, "Platelets": 2}
 CLASS_NAMES = {0: "WBC", 1: "RBC", 2: "Platelets"}
@@ -479,7 +480,7 @@ print("\\nLabel distribution from LabelModel:")
 print(df_lf["snorkel_label_name"].value_counts())
 
 # Compare LabelModel vs majority vote vs individual LFs
-majority_model = MajorityLabelVoter()
+majority_model = MajorityLabelVoter(cardinality=3)
 majority_preds = majority_model.predict(L_train)
 
 # Get accuracy where we have ground truth
@@ -502,8 +503,9 @@ if gt_mask.sum() > 0:
             print(f"    {lf.name}: acc={lf_acc:.1%}, cov={lf_cov:.1%}")"""))
 
 cells.append(make_code("""# LFAnalysis details
-lf_summary = lf_analysis.lf_summary(L_train)
-print("\\nLabeling Function Summary:")
+# Call without Y (ground truth) since not all proposals have GT labels
+lf_summary = lf_analysis.lf_summary()
+print("\\nLabeling Function Summary (coverage, conflicts, polarity):")
 print(lf_summary)
 
 # Plot LF statistics
@@ -762,20 +764,20 @@ class BCCDDataset(Dataset):
         image = cv2.imread(img_path)
         image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         annotations = self.annotations_by_image.get(img_info["id"], [])
-        labels = [ann["category_id"] for ann in annotations]
-        boxes = [ann["bbox"] for ann in annotations]
 
-        # COCO bbox format: [x, y, w, h]
-        boxes_tensor = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros((0, 4))
-        labels_tensor = torch.tensor(labels, dtype=torch.long) if labels else torch.zeros(0, dtype=torch.long)
+        # Build COCO-format annotations list
+        coco_annotations = []
+        for ann in annotations:
+            coco_annotations.append({
+                "bbox": ann["bbox"],
+                "category_id": ann["category_id"],
+                "area": ann["bbox"][2] * ann["bbox"][3],
+                "iscrowd": 0,
+            })
 
         encoding = self.image_processor(
             images=image,
-            annotations={"image_id": img_info["id"], "objects": {
-                "bbox": boxes_tensor, "category_id": labels_tensor,
-                "area": boxes_tensor[:, 2] * boxes_tensor[:, 3] if len(boxes_tensor) > 0 else torch.zeros(0),
-                "iscrowd": torch.zeros(len(boxes_tensor)) if len(boxes_tensor) > 0 else torch.zeros(0),
-            }},
+            annotations={"image_id": img_info["id"], "annotations": coco_annotations},
             return_tensors="pt",
         )
         # Remove batch dimension added by processor
@@ -830,7 +832,12 @@ cells.append(make_md("""## 9. DETR Fine-Tuning
 We fine-tune a pretrained DETR model using our weakly-labeled data."""))
 
 cells.append(make_code("""# @title Initialize DETR Model
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
 print(f"Using device: {device}")
 
 model = DetrForObjectDetection.from_pretrained(
@@ -847,7 +854,7 @@ training_args = TrainingArguments(
     per_device_train_batch_size=4,
     per_device_eval_batch_size=4,
     num_train_epochs=10,
-    evaluation_strategy="steps",
+    eval_strategy="steps",
     eval_steps=20,
     logging_steps=10,
     save_steps=50,
@@ -857,17 +864,21 @@ training_args = TrainingArguments(
     remove_unused_columns=False,
     report_to="none",
     fp16=torch.cuda.is_available(),
-    dataloader_num_workers=2,
+    dataloader_num_workers=0,
     push_to_hub=False,
 )
 
-def collate_fn(batch):
+def collate_fn(batch, include_extra=False):
     pixel_values = torch.stack([item["pixel_values"] for item in batch])
     pixel_mask = torch.stack([item["pixel_mask"] for item in batch])
-    labels = [item["labels"] for item in batch]
-    orig_sizes = torch.stack([item["orig_size"] for item in batch])
-    image_ids = [item["image_id"] for item in batch]
-    return {"pixel_values": pixel_values, "pixel_mask": pixel_mask, "labels": labels, "orig_sizes": orig_sizes, "image_ids": image_ids}
+    labels = [item["labels"][0] for item in batch]
+    result = {"pixel_values": pixel_values, "pixel_mask": pixel_mask, "labels": labels}
+    if include_extra:
+        orig_sizes = torch.stack([item["orig_size"] for item in batch])
+        image_ids = [item["image_id"] for item in batch]
+        result["orig_sizes"] = orig_sizes
+        result["image_ids"] = image_ids
+    return result
 
 trainer = Trainer(
     model=model,
@@ -913,7 +924,7 @@ model.eval()
 results_list = []
 
 with torch.no_grad():
-    for batch in DataLoader(val_dataset, batch_size=4, collate_fn=collate_fn):
+    for batch in DataLoader(val_dataset, batch_size=4, collate_fn=partial(collate_fn, include_extra=True)):
         pixel_values = batch["pixel_values"].to(device)
         pixel_mask = batch["pixel_mask"].to(device)
         orig_sizes = batch["orig_sizes"].to(device)
