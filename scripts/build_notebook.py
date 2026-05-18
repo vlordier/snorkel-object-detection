@@ -25,7 +25,9 @@ cells = []
 # ============================================================
 cells.append(make_md("""# Snorkel for Object Detection: Weak Supervision on Pascal VOC 2012
 
-This tutorial demonstrates how to use **Snorkel** (a programmatic data labeling framework) to bootstrap object detection with weak supervision.
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github)
+
+This tutorial demonstrates how to use **Snorkel** (a programmatic data labeling framework) to bootstrap object detection with weak supervision. Optimized for Google Colab (GPU).
 
 ## Pipeline Overview
 
@@ -39,9 +41,11 @@ VOC 2012 images → Selective Search proposals → Snorkel LFs → LabelModel
 - **~11,530 images** with difficult but visually distinct objects
 - Each class has distinct visual properties (color, shape, position) suited to heuristic labeling"""))
 
-cells.append(make_code("""# @title Install dependencies
-!pip install -q snorkel transformers torch torchvision opencv-contrib-python matplotlib seaborn scikit-learn scipy pycocotools
-!pip install -q gitpython"""))
+cells.append(make_code("""# @title Install dependencies (Colab-safe)
+# torch/torchvision/transformers are pre-installed on Colab with CUDA support.
+# We only pip-install what's missing.
+!pip install -q snorkel opencv-contrib-python pycocotools seaborn 2>&1 | tail -1
+print("Dependencies ready. (torch+transtormers use pre-installed versions)")"""))
 
 cells.append(make_code("""import os
 import json
@@ -118,13 +122,7 @@ cells.append(make_md("""## 2. Dataset Download & Exploration
 We download Pascal VOC 2012 and parse the XML annotations. We select 4 visually distinct classes (aeroplane, boat, bottle, pottedplant) that are well-suited to heuristic labeling."""))
 
 cells.append(make_code("""# @title Download Pascal VOC 2012
-try:
-    import torchvision
-    from torchvision.datasets import VOCDetection
-except ImportError:
-    !pip install -q torchvision
-    import torchvision
-    from torchvision.datasets import VOCDetection
+from torchvision.datasets import VOCDetection
 
 DATA_DIR = "voc_dataset"
 VOC_ROOT = os.path.join(DATA_DIR, "VOCdevkit")
