@@ -118,7 +118,9 @@ CLASS_NAMES = {0: "aeroplane", 1: "boat", 2: "bottle", 3: "pottedplant"}
 def parse_voc_xml(xml_path):
     tree = ET.parse(xml_path)
     root = tree.getroot()
-    filename = root.find("filename").text + ".jpg"
+    filename = root.find("filename").text
+    if not filename.lower().endswith((".jpg", ".jpeg", ".png", ".bmp")):
+        filename += ".jpg"
     size = root.find("size")
     width = int(size.find("width").text)
     height = int(size.find("height").text)
@@ -602,7 +604,7 @@ print("\\nLabel distribution from LabelModel:")
 print(df_lf["snorkel_label_name"].value_counts())
 
 # Compare LabelModel vs majority vote vs individual LFs
-majority_model = MajorityLabelVoter(cardinality=3)
+majority_model = MajorityLabelVoter(cardinality=4)
 majority_preds = majority_model.predict(L_train)
 
 # Get accuracy where we have ground truth
@@ -1021,8 +1023,17 @@ training_args = TrainingArguments(
 )
 
 def collate_fn(batch, include_extra=False):
-    pixel_values = torch.stack([item["pixel_values"] for item in batch])
-    pixel_mask = torch.stack([item["pixel_mask"] for item in batch])
+    pixel_values_list = [item["pixel_values"] for item in batch]
+    pixel_mask_list = [item["pixel_mask"] for item in batch]
+    max_h = max(pv.shape[1] for pv in pixel_values_list)
+    max_w = max(pv.shape[2] for pv in pixel_values_list)
+    batch_size = len(batch)
+    pixel_values = torch.zeros(batch_size, 3, max_h, max_w, dtype=pixel_values_list[0].dtype)
+    pixel_mask = torch.zeros(batch_size, max_h, max_w, dtype=pixel_mask_list[0].dtype)
+    for i, (pv, pm) in enumerate(zip(pixel_values_list, pixel_mask_list)):
+        h, w = pv.shape[1], pv.shape[2]
+        pixel_values[i, :, :h, :w] = pv
+        pixel_mask[i, :h, :w] = pm
     labels = [item["labels"][0] for item in batch]
     result = {"pixel_values": pixel_values, "pixel_mask": pixel_mask, "labels": labels}
     if include_extra:

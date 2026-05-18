@@ -14,5 +14,9 @@ env/
 # Generated artifacts
 bccd_dataset/
 detr_bccd_weak/
+detr_voc_weak/
+notebooks/detr_voc_weak/
+voc_dataset/
+notebooks/voc_dataset/
 weak_annotations/
 /tmp/
