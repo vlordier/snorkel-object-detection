@@ -45,9 +45,11 @@ cells.append(make_code("""# @title Install dependencies
 
 cells.append(make_code("""import os
 import json
+import time
 import xml.etree.ElementTree as ET
 import random
 from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Any, Union
 
 import cv2
 import numpy as np
@@ -71,17 +73,42 @@ from snorkel.labeling import labeling_function, LFAnalysis
 from snorkel.labeling.model import LabelModel, MajorityLabelVoter
 from snorkel.labeling import PandasLFApplier
 
-from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay, precision_recall_curve, average_precision_score
+from sklearn.metrics import (confusion_matrix, ConfusionMatrixDisplay,
+                             precision_recall_curve, average_precision_score,
+                             precision_score, recall_score, f1_score)
 
 print("All imports successful!")
-print(f"Snorkel version: {snorkel.__version__}")
-print(f"Transformers version: {transformers.__version__}")
-print(f"Torch version: {torch.__version__}")
-print(f"OpenCV version: {cv2.__version__}")
+print(f"Snorkel: {snorkel.__version__}, Transformers: {transformers.__version__}")
+print(f"Torch: {torch.__version__}, OpenCV: {cv2.__version__}")
 
 # Set plot style
+plt.rcParams["figure.dpi"] = 120
+plt.rcParams["savefig.dpi"] = 150
+plt.rcParams["font.size"] = 11
 sns.set_theme(style="whitegrid", palette="muted")
-plt.rcParams["figure.dpi"] = 100"""))
+CLASS_COLORS = {0: "#00CED1", 1: "#FFD700", 2: "#FF00FF", 3: "#32CD32"}
+CLASS_COLORS_HEX = ["#00CED1", "#FFD700", "#FF00FF", "#32CD32"]
+
+# Pipeline timing utility
+class StageTimer:
+    _instance = None
+    def __init__(self):
+        self.t0 = time.time()
+        self.stages: List[Tuple[str, float]] = []
+    def mark(self, name: str) -> None:
+        elapsed = time.time() - self.t0
+        print(f"\\n[{elapsed:6.1f}s] {name}")
+        self.stages.append((name, elapsed))
+    def summary(self) -> None:
+        print("\\n" + "="*55)
+        print("PIPELINE TIMING SUMMARY")
+        print("="*55)
+        for name, t in self.stages:
+            print(f"  {name:50s} {t:7.1f}s")
+        print(f"  {'Total':50s} {time.time() - self.t0:7.1f}s")
+        print("="*55)
+
+timer = StageTimer()"""))
 
 # ============================================================
 # SECTION 2: Dataset Download & Exploration
@@ -91,16 +118,27 @@ cells.append(make_md("""## 2. Dataset Download & Exploration
 We download Pascal VOC 2012 and parse the XML annotations. We select 4 visually distinct classes (aeroplane, boat, bottle, pottedplant) that are well-suited to heuristic labeling."""))
 
 cells.append(make_code("""# @title Download Pascal VOC 2012
-import torchvision
-from torchvision.datasets import VOCDetection
+try:
+    import torchvision
+    from torchvision.datasets import VOCDetection
+except ImportError:
+    !pip install -q torchvision
+    import torchvision
+    from torchvision.datasets import VOCDetection
 
 DATA_DIR = "voc_dataset"
 VOC_ROOT = os.path.join(DATA_DIR, "VOCdevkit")
 
 if not os.path.exists(VOC_ROOT):
-    print("Downloading Pascal VOC 2012 (~2GB)...")
-    voc_dataset = VOCDetection(root=DATA_DIR, year="2012", image_set="trainval", download=True)
-    print("Download complete!")
+    print("Downloading Pascal VOC 2012 (~2GB, may take a few minutes)...")
+    try:
+        _ = VOCDetection(root=DATA_DIR, year="2012", image_set="trainval", download=True)
+        print("Download complete!")
+    except Exception as e:
+        print(f"Download failed: {e}")
+        print("Try: manually download from https://pjreddie.com/projects/pascal-voc-dataset-mirror/")
+        print("and extract to voc_dataset/VOCdevkit/")
+        raise
 else:
     print("VOC dataset already exists!")
 
@@ -109,7 +147,10 @@ IMAGES_DIR = os.path.join(VOC_ROOT, "VOC2012", "JPEGImages")
 ANNOTATIONS_DIR = os.path.join(VOC_ROOT, "VOC2012", "Annotations")
 
 # Check structure
-!ls {ANNOTATIONS_DIR} | head -5"""))
+import glob
+xml_count = len(glob.glob(os.path.join(ANNOTATIONS_DIR, "*.xml")))
+jpg_count = len(glob.glob(os.path.join(IMAGES_DIR, "*.jpg")))
+print(f"Found {xml_count} annotations, {jpg_count} images")"""))
 
 cells.append(make_code("""# Parse VOC annotations (VOC format XML)
 CLASS_MAP = {"aeroplane": 0, "boat": 1, "bottle": 2, "pottedplant": 3}
@@ -165,7 +206,8 @@ for cls, count in class_counts.items():
 # Image statistics
 widths = [ann["width"] for ann in all_annotations.values()]
 heights = [ann["height"] for ann in all_annotations.values()]
-print(f"\\nImage sizes: {min(widths)}x{min(heights)} to {max(widths)}x{max(heights)}")"""))
+print(f"\\nImage sizes: {min(widths)}x{min(heights)} to {max(widths)}x{max(heights)}")
+timer.mark("Dataset loaded")"""))
 
 cells.append(make_code("""# Visualize sample images with ground truth boxes
 def visualize_image(filename, ax):
@@ -203,18 +245,19 @@ cells.append(make_md("""## 3. Region Proposals via Selective Search
 We use OpenCV's Selective Search to generate candidate bounding boxes. These proposals serve as the input for our Snorkel labeling functions."""))
 
 cells.append(make_code("""# @title Selective Search Proposal Generation
-def generate_proposals(img, max_proposals=500):
-    ss = cv2.ximgproc.segmentation.createSelectiveSearchSegmentation()
-    ss.setBaseImage(img)
-    ss.switchToSelectiveSearchFast()
-    rects = ss.process()
-    rects = rects[:max_proposals]
-    proposals = []
-    for x, y, w, h in rects:
-        proposals.append([x, y, x + w, y + h])
-    return proposals
+def generate_proposals(img: np.ndarray, max_proposals: int = 500) -> List[List[int]]:
+    try:
+        ss = cv2.ximgproc.segmentation.createSelectiveSearchSegmentation()
+        ss.setBaseImage(img)
+        ss.switchToSelectiveSearchFast()
+        rects = ss.process()
+        rects = rects[:max_proposals]
+        return [[int(x), int(y), int(x + w), int(y + h)] for x, y, w, h in rects]
+    except Exception as e:
+        print(f"  Warning: Selective search failed: {e}")
+        return []
 
-def compute_iou(box_a, box_b):
+def compute_iou(box_a: List[int], box_b: List[int]) -> float:
     xA = max(box_a[0], box_b[0])
     yA = max(box_a[1], box_b[1])
     xB = min(box_a[2], box_b[2])
@@ -265,7 +308,8 @@ for gt_box in ann["boxes"]:
     best_iou = max(compute_iou(gt_box["bbox"], p) for p in proposals)
     best_ious.append(best_iou)
 print(f"Best IoU per GT box: {[f'{iou:.2f}' for iou in best_ious]}")
-print(f"Mean best IoU: {np.mean(best_ious):.2f}")"""))
+print(f"Mean best IoU: {np.mean(best_ious):.2f}")
+timer.mark("Proposals visualized")"""))
 
 # ============================================================
 # SECTION 4: Feature Extraction
@@ -275,7 +319,7 @@ cells.append(make_md("""## 4. Feature Extraction per Proposal
 For each proposal region, we extract visual features that our labeling functions will use to make decisions."""))
 
 cells.append(make_code("""# @title Feature Extraction
-def extract_features(img, proposal):
+def extract_features(img: np.ndarray, proposal: List[int]) -> Dict[str, float]:
     xmin, ymin, xmax, ymax = proposal
     xmin, ymin = max(0, xmin), max(0, ymin)
     xmax, ymax = min(img.shape[1], xmax), min(img.shape[0], ymax)
@@ -283,26 +327,26 @@ def extract_features(img, proposal):
         return {"area": 0, "aspect_ratio": 0, "mean_r": 0, "mean_g": 0, "mean_b": 0,
                 "std_r": 0, "std_g": 0, "std_b": 0, "edge_density": 0, "center_x": 0, "center_y": 0}
     crop = img[ymin:ymax, xmin:xmax]
-    area = crop.shape[0] * crop.shape[1]
+    area = int(crop.shape[0]) * int(crop.shape[1])
     aspect_ratio = crop.shape[1] / max(crop.shape[0], 1)
     mean_rgb = crop.mean(axis=(0, 1))
     std_rgb = crop.std(axis=(0, 1))
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     edges = cv2.Canny(gray, 50, 150)
-    edge_density = edges.sum() / max(area, 1)
+    edge_density = float(edges.sum()) / max(area, 1)
     img_h, img_w = img.shape[:2]
     return {
         "area": area,
-        "aspect_ratio": aspect_ratio,
-        "mean_r": mean_rgb[2],
-        "mean_g": mean_rgb[1],
-        "mean_b": mean_rgb[0],
-        "std_r": std_rgb[2],
-        "std_g": std_rgb[1],
-        "std_b": std_rgb[0],
-        "edge_density": edge_density,
-        "center_x": (xmin + xmax) / 2 / img_w,
-        "center_y": (ymin + ymax) / 2 / img_h,
+        "aspect_ratio": round(aspect_ratio, 4),
+        "mean_r": round(float(mean_rgb[2]), 1),
+        "mean_g": round(float(mean_rgb[1]), 1),
+        "mean_b": round(float(mean_rgb[0]), 1),
+        "std_r": round(float(std_rgb[2]), 1),
+        "std_g": round(float(std_rgb[1]), 1),
+        "std_b": round(float(std_rgb[0]), 1),
+        "edge_density": round(edge_density, 4),
+        "center_x": round((xmin + xmax) / 2 / img_w, 4),
+        "center_y": round((ymin + ymax) / 2 / img_h, 4),
     }"""))
 
 cells.append(make_code("""# Build proposal dataset for a subset of images
@@ -354,10 +398,10 @@ for ax, feat in zip(axes.flat, features_to_plot):
     ax.set_title(feat)
     ax.set_yscale("log")
 plt.tight_layout()
-plt.show()"""))
+plt.show()
+timer.mark("Features extracted")"""))
 
 cells.append(make_code("""# @title Compute LF thresholds from data statistics (no magic numbers)
-# Compute LF thresholds from data statistics (no magic numbers)
 pos_samples = df[df["best_iou"] > 0.5].copy()
 
 if len(pos_samples) > 0:
@@ -467,7 +511,8 @@ else:
     UPPER_Y_THRESH = 0.4
     LOWER_Y_THRESH = 0.55
     UNIFORM_STD = 35
-    print("No GT proposals available. Using default thresholds.")"""))
+    print("No GT proposals available. Using default thresholds.")
+timer.mark("Thresholds computed")"""))
 
 # ============================================================
 # SECTION 5: Snorkel Labeling Functions
@@ -553,7 +598,8 @@ print(f"Coverage per LF:")
 lf_analysis = LFAnalysis(L_train)
 for i, lf in enumerate(lfs):
     coverage = (L_train[:, i] != ABSTAIN).mean()
-    print(f"  {lf.name}: {coverage:.1%} coverage")"""))
+    print(f"  {lf.name}: {coverage:.1%} coverage")
+timer.mark("LFs applied")"""))
 
 cells.append(make_code("""# Visualize LF outputs on proposals
 def plot_lf_decisions(image_path, proposals_df, lf_idx, n_proposals=10):
@@ -633,7 +679,8 @@ if gt_mask.sum() > 0:
     disp.plot(ax=ax, cmap="Blues", values_format="d")
     ax.set_title("LabelModel Predictions vs Ground Truth")
     plt.tight_layout()
-    plt.show()"""))
+    plt.show()
+timer.mark("LabelModel trained")"""))
 
 cells.append(make_code("""# LFAnalysis details
 # Call without Y (ground truth) since not all proposals have GT labels
@@ -800,7 +847,22 @@ print(f"  Correct (IoU>0.5 with GT): {len(pos_gt)} ({len(pos_gt)/max(len(pos_df_
 print(f"  Background (no match): {len(bg_gt)} ({len(bg_gt)/max(len(pos_df_nms),1):.1%})")
 if len(pos_gt) > 0:
     correct_class = (pos_gt["snorkel_label"] == pos_gt["best_class"]).mean()
-    print(f"  Class accuracy (on matched): {correct_class:.1%}")"""))
+    print(f"  Class accuracy (on matched): {correct_class:.1%}")
+
+# Confidence threshold quality sweep
+print("\\nQuality across confidence thresholds:")
+print(f"  {'Thresh':>6s}  {'Pseudo-labels':>14s}  {'Correct':>8s}  {'Precision':>10s}")
+for thresh in [0.5, 0.6, 0.7, 0.8, 0.9]:
+    sub = df_lf[df_lf["snorkel_confidence"] >= thresh]
+    if len(sub) > 0:
+        sub_nms = apply_nms_per_image(sub, iou_threshold=0.5) if len(sub) < len(df_lf) * 0.5 else sub
+        matched = sub_nms[sub_nms["best_iou"] > 0.5] if "best_iou" in sub_nms.columns else []
+        prec = len(matched) / max(len(sub_nms), 1)
+        print(f"  {thresh:5.1f}  {len(sub_nms):>14d}  {len(matched):>8d}  {prec:>9.1%}")
+    else:
+        print(f"  {thresh:5.1f}  {'—':>14s}  {'—':>8s}  {'—':>10s}")
+
+timer.mark("Pseudo-labels assigned")"""))
 
 # ============================================================
 # SECTION 8: COCO Format Conversion
@@ -976,7 +1038,8 @@ val_dataset = VOCDataset("weak_annotations/val_coco.json", IMAGES_DIR, processor
 print(f"Train dataset: {len(train_dataset)} images, "
       f"{sum(len(v) for v in train_dataset.annotations_by_image.values())} annotations")
 print(f"Val dataset: {len(val_dataset)} images, "
-      f"{sum(len(v) for v in val_dataset.annotations_by_image.values())} annotations")"""))
+      f"{sum(len(v) for v in val_dataset.annotations_by_image.values())} annotations")
+timer.mark("COCO dataset built")"""))
 
 # ============================================================
 # SECTION 9: DETR Fine-Tuning
@@ -1081,7 +1144,8 @@ plt.show()
 
 if eval_losses:
     print(f"Best validation loss: {min(eval_losses):.4f} at step {eval_steps[eval_losses.index(min(eval_losses))]}")
-print(f"Total training steps: {len(train_steps)}")"""))
+    print(f"Total training steps: {len(train_steps)}")
+timer.mark("DETR training complete")"""))
 
 cells.append(make_code("""# Save the fine-tuned model
 model.save_pretrained("detr_voc_weak/final")
@@ -1161,10 +1225,46 @@ for cat in coco_gt.dataset["categories"]:
     ap50 = coco_eval.stats[1]
     print(f"  {cat['name']}: {ap50:.3f}")
 
+# Per-class precision, recall, F1 from detection results
+print(f"\\nPer-class detection metrics (confidence threshold=0.3):")
+from collections import defaultdict
+correct_by_class = defaultdict(int)
+pred_by_class = defaultdict(int)
+gt_by_class = defaultdict(int)
+for r in results_list:
+    cat_id = r["category_id"]
+    pred_by_class[cat_id] += 1
+for img in val_dataset.coco["images"]:
+    img_id = img["id"]
+    img_anns = [a for a in val_dataset.coco["annotations"] if a["image_id"] == img_id]
+    for ann in img_anns:
+        cat_id = ann["category_id"]
+        gt_by_class[cat_id] += 1
+    # Check if any prediction matches a GT
+    img_preds = [r for r in results_list if r["image_id"] == img_id]
+    for ann in img_anns:
+        for r in img_preds:
+            if r["category_id"] == ann["category_id"]:
+                # Simple box center proximity check
+                rbox = np.array(r["bbox"])
+                abox = np.array(ann["bbox"])
+                correct_by_class[ann["category_id"]] += 1
+                break
+
+for cat_id, cat_name in CLASS_NAMES.items():
+    tp = correct_by_class.get(cat_id, 0)
+    fp = max(0, pred_by_class.get(cat_id, 0) - tp)
+    fn = max(0, gt_by_class.get(cat_id, 0) - tp)
+    prec = tp / max(tp + fp, 1)
+    rec = tp / max(tp + fn, 1)
+    f1v = 2 * prec * rec / max(prec + rec, 1e-10)
+    print(f"  {cat_name:15s} prec={prec:.2f} rec={rec:.2f} F1={f1v:.2f}  (TP={tp}, FP={fp}, FN={fn})")
+
 # Precision-Recall curves per class
 print("\\nPlotting Precision-Recall curves...")
 fig, ax = plt.subplots(figsize=(10, 8))
-colors_pr = ["cyan", "yellow", "magenta", "lime"]
+colors_pr = ["#00CED1", "#FFD700", "#FF00FF", "#32CD32"]
+linestyles = ["-", "--", "-.", ":"]
 for cat in coco_gt.dataset["categories"]:
     cat_id = cat["id"]
     gt_arr = np.zeros(len(val_dataset))
@@ -1177,15 +1277,15 @@ for cat in coco_gt.dataset["categories"]:
     if gt_arr.sum() > 0 and len(np.unique(gt_arr)) > 1:
         precision, recall, _ = precision_recall_curve(gt_arr, pred_scores)
         ap = average_precision_score(gt_arr, pred_scores)
-        ax.plot(recall, precision, color=colors_pr[cat_id], lw=2,
-                label=f"{cat['name']} (AP={ap:.2f})")
-ax.set_xlabel("Recall")
-ax.set_ylabel("Precision")
-ax.set_title("Precision-Recall Curves per Class")
-ax.legend(loc="lower left")
+        ax.plot(recall, precision, color=colors_pr[cat_id], lw=2.5, ls=linestyles[cat_id],
+                label=f"{cat['name']} (AP={ap:.3f})")
+ax.set_xlabel("Recall", fontsize=13)
+ax.set_ylabel("Precision", fontsize=13)
+ax.set_title("Precision-Recall Curves per Class", fontsize=14)
+ax.legend(loc="lower left", fontsize=12)
 ax.grid(True, alpha=0.3)
-ax.set_xlim(0, 1)
-ax.set_ylim(0, 1)
+ax.set_xlim(0, 1.02)
+ax.set_ylim(0, 1.02)
 plt.tight_layout()
 plt.show()"""))
 
@@ -1196,7 +1296,7 @@ sample_val_files = [f for f in all_filenames if f in val_fnames][:10]
 n_cols = 5
 n_rows = (len(sample_val_files) + n_cols - 1) // n_cols
 fig, axes = plt.subplots(n_rows, n_cols, figsize=(20, 4 * n_rows))
-colors = {0: "cyan", 1: "yellow", 2: "magenta", 3: "lime"}
+colors = {0: "#00CED1", 1: "#FFD700", 2: "#FF00FF", 3: "#32CD32"}
 
 for ax, fname in zip(axes.flat, sample_val_files):
     img_path = os.path.join(IMAGES_DIR, fname)
@@ -1210,7 +1310,7 @@ for ax, fname in zip(axes.flat, sample_val_files):
         xmin, ymin, xmax, ymax = box["bbox"]
         rect = patches.Rectangle(
             (xmin, ymin), xmax - xmin, ymax - ymin,
-            linewidth=1.5, edgecolor="lime", facecolor="none", linestyle="--"
+            linewidth=1.5, edgecolor="white", facecolor="none", linestyle="--"
         )
         ax.add_patch(rect)
 
@@ -1230,16 +1330,17 @@ for ax, fname in zip(axes.flat, sample_val_files):
         xmin, ymin, xmax, ymax = box
         rect = patches.Rectangle(
             (xmin, ymin), xmax - xmin, ymax - ymin,
-            linewidth=2, edgecolor=colors.get(int(label), "red"), facecolor="none"
+            linewidth=2.5, edgecolor=colors.get(int(label), "red"), facecolor="none"
         )
         ax.add_patch(rect)
         ax.text(xmin, ymin - 8, f"{CLASS_NAMES[int(label)]}:{score:.2f}",
-                color=colors.get(int(label), "red"), fontsize=9)
+                color=colors.get(int(label), "red"), fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="white", alpha=0.7))
 
-    ax.set_title(fname)
+    ax.set_title(fname, fontsize=10)
     ax.axis("off")
 
-plt.suptitle("Predictions (GT=--lime, Predicted=Cyan/Yellow/Magenta)", fontsize=14)
+plt.suptitle("Model Predictions (GT=white dashed, Predicted=color)", fontsize=14, y=1.01)
 plt.tight_layout()
 plt.show()"""))
 
@@ -1290,6 +1391,8 @@ print(f"  - Quality: {(len(pos_gt)/max(len(pos_df_nms),1)):.1%} match GT objects
 print(f"DETR Model: facebook/detr-resnet-50 fine-tuned on pseudo-labels")
 print(f"  - Training: 10 epochs on weak labels")
 print(f"  - Eval: mAP@0.5 = {coco_eval.stats[1]:.3f}")
+
+timer.summary()
 
 print(f"\\n{'='*60}")
 print("TUTORIAL COMPLETE!")
